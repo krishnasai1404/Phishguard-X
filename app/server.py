@@ -1,0 +1,258 @@
+
+"""PhishGuard-X API. Run with: python -m app.server"""
+
+import time
+import joblib
+import pandas as pd
+
+from flask import Flask, request, jsonify, render_template_string
+from src import features, html_features
+from src.fusion import reasons
+from urllib.parse import urlsplit, urlunsplit
+
+B = joblib.load("results/model.joblib")
+fusion = B["fusion"]
+ucols = B["url_cols"]
+hcols = B["html_cols"]
+
+app = Flask(__name__)
+
+PHISHING_THRESHOLD = 0.35
+
+PAGE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhishGuard-X | Phishing Detection</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:#0b1020;color:#edf2ff;font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:20px}
+.card{width:100%;max-width:680px;background:#151d32;border:1px solid #2a3653;border-radius:22px;padding:32px;box-shadow:0 20px 60px #0005}
+.logo{font-size:32px;font-weight:800;color:#64e6c2}
+.sub{color:#aab7d0;line-height:1.6}
+h1{margin-bottom:8px}
+label{display:block;margin:24px 0 10px;font-weight:bold}
+input,textarea{width:100%;padding:14px;border-radius:10px;border:1px solid #3b4968;background:#0b1020;color:white;font-size:15px}
+textarea{resize:vertical;font-family:monospace}
+button{width:100%;margin-top:14px;padding:15px;border:0;border-radius:10px;background:#64e6c2;color:#07131a;font-weight:bold;font-size:16px;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}
+#result{display:none;margin-top:22px;padding:18px;background:#0b1020;border-radius:12px;overflow-wrap:anywhere;border:1px solid #2a3653}
+.muted{font-size:13px;color:#aab7d0;line-height:1.6}
+.footer{margin-top:22px;font-size:12px;color:#8d9bb7;line-height:1.6}
+.pill{display:inline-block;padding:7px 12px;border-radius:20px;font-weight:bold}
+.high{background:#48232b;color:#ff9ca7}
+.medium{background:#49391d;color:#ffd783}
+.low{background:#163d35;color:#7ce9ca}
+.warning{padding:12px;background:#342b19;color:#ffe0a1;border-radius:9px;line-height:1.5}
+</style>
+</head>
+<body>
+<main class="card">
+    <div class="logo">🛡 PhishGuard-X</div>
+    <h1>Phishing Detection</h1>
+    <p class="sub">Analyze a URL using URL features and optionally webpage HTML.</p>
+
+    <form id="scan">
+        <label for="url">Website URL</label>
+        <input id="url" type="url" placeholder="https://example.com" required>
+
+        <label for="html">Webpage HTML (optional)</label>
+        <textarea id="html" rows="5" placeholder="Paste webpage HTML for multimodal analysis"></textarea>
+
+        <button id="btn" type="submit">Analyze Website</button>
+    </form>
+
+    <div id="result" aria-live="polite"></div>
+
+    <p class="footer">
+        Research prototype only. Predictions can be wrong.
+        Do not use this tool alone to decide whether a website is safe.
+    </p>
+</main>
+
+<script>
+const form = document.getElementById("scan");
+const result = document.getElementById("result");
+const btn = document.getElementById("btn");
+
+form.addEventListener("submit", async event => {
+    event.preventDefault();
+    result.style.display = "block";
+    result.textContent = "Analyzing website...";
+    btn.disabled = true;
+
+    try {
+        const response = await fetch("/predict", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                url: document.getElementById("url").value.trim(),
+                html: document.getElementById("html").value
+            })
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || "Request failed");
+        }
+
+        result.replaceChildren();
+
+        const heading = document.createElement("h2");
+        heading.textContent = "Website Analysis";
+
+        const risk = document.createElement("span");
+        risk.className = "pill " + data.risk.toLowerCase();
+        risk.textContent = "Risk: " + data.risk;
+
+        const prediction = document.createElement("p");
+        prediction.textContent = "Classification: " + data.prediction;
+
+        const score = document.createElement("h2");
+        score.textContent = "Phishing probability: " +
+            (data.phishing_probability * 100).toFixed(2) + "%";
+
+        const urlScore = document.createElement("p");
+        urlScore.textContent = "URL model score: " +
+            (data.modalities.url * 100).toFixed(2) + "%";
+
+        const htmlScore = document.createElement("p");
+        htmlScore.textContent = data.modalities.html === null
+            ? "HTML model score: Not available (no HTML supplied)"
+            : "HTML model score: " +
+              (data.modalities.html * 100).toFixed(2) + "%";
+
+        const latency = document.createElement("p");
+        latency.className = "muted";
+        latency.textContent = "Analysis time: " + data.latency_ms + " ms";
+
+        const explanation = document.createElement("p");
+        explanation.textContent = "Explanation: " +
+            ((data.reasons || []).join("; ") || "No explanation available.");
+
+        const warning = document.createElement("p");
+        warning.className = "warning";
+        warning.textContent = data.model_warning;
+
+        const note = document.createElement("p");
+        note.className = "muted";
+        note.textContent =
+            "A model score is not proof that a website is malicious or safe.";
+
+        result.append(
+            heading, risk, prediction, score, urlScore,
+            htmlScore, latency, explanation, warning, note
+        );
+    } catch (error) {
+        result.textContent = "Error: " + error.message;
+    } finally {
+        btn.disabled = false;
+    }
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def home():
+    return render_template_string(PAGE)
+
+
+@app.after_request
+def cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+
+@app.route("/predict", methods=["POST", "OPTIONS"])
+def predict():
+    if request.method == "OPTIONS":
+        return jsonify({}), 200
+
+    data = request.get_json(silent=True) or {}
+    url = data.get("url", "")
+    html = data.get("html") or ""
+
+    if not isinstance(url, str) or not url.strip():
+        return jsonify(error="Please provide a URL."), 400
+
+    url = url.strip()
+
+    if not url.lower().startswith(("http://", "https://")):
+        return jsonify(error="URL must begin with http:// or https://."), 400
+
+    if not isinstance(html, str):
+        return jsonify(error="HTML must be a string."), 400
+
+    if len(url) > 8192 or len(html) > 2_000_000:
+        return jsonify(error="Input exceeds the allowed size."), 413
+
+    start = time.perf_counter()
+
+    try:
+        parsed = urlsplit(url)
+        if not parsed.path:
+            url = urlunsplit((parsed.scheme, parsed.netloc, "/", parsed.query, parsed.fragment))
+        u = features.extract(url)
+        parsed = urlsplit(url)
+        if not parsed.path:
+        	url = urlunsplit((parsed.scheme, parsed.netloc, "/", parsed.query, parsed.fragment))
+        h = html_features.extract(html, url) if html.strip() else None
+
+        parts = fusion.predict_parts(
+            pd.DataFrame([u])[ucols],
+            pd.DataFrame([h])[hcols] if h is not None else None
+        )
+
+        p = float(parts["fused"][0] if h is not None else parts["url"][0])
+        p = max(0.0, min(1.0, p))
+
+        prediction = (
+            "PHISHING" if p >= PHISHING_THRESHOLD else "LEGITIMATE"
+        )
+        risk = (
+            "HIGH" if p >= 0.8
+            else "MEDIUM" if p >= 0.5
+            else "LOW"
+        )
+
+        return jsonify(
+            url=url,
+            phishing_probability=round(p, 4),
+            prediction=prediction,
+            risk=risk,
+            threshold=PHISHING_THRESHOLD,
+            modalities={
+                "url": round(float(parts["url"][0]), 4),
+                "html": (
+                    None if parts["html"] is None
+                    else round(float(parts["html"][0]), 4)
+                )
+            },
+            reasons=reasons(u, h, p),
+            model_warning=(
+                "The current model has misclassified known legitimate websites "
+                "during testing. Treat this result as experimental until the "
+                "model is retrained and independently validated."
+            ),
+            latency_ms=round(
+                (time.perf_counter() - start) * 1000, 2
+            )
+        )
+
+    except Exception:
+        app.logger.exception("Prediction failed")
+        return jsonify(
+            error="Prediction failed. Check the server logs."
+        ), 500
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=False)
